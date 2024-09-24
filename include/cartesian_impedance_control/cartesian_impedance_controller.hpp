@@ -85,15 +85,18 @@ public:
  private:
     //Nodes
     rclcpp::Subscription<franka_msgs::msg::FrankaRobotState>::SharedPtr franka_state_subscriber = nullptr;
+    rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr desired_pose_sub;
     rclcpp::Service<messages_fr3::srv::SetPose>::SharedPtr pose_srv_;
 
 
     //Functions
     void topic_callback(const std::shared_ptr<franka_msgs::msg::FrankaRobotState> msg);
+    void reference_pose_callback(const geometry_msgs::msg::Pose::SharedPtr msg);
     void updateJointStates();
     void update_stiffness_and_references();
     void arrayToMatrix(const std::array<double, 6>& inputArray, Eigen::Matrix<double, 6, 1>& resultMatrix);
     void arrayToMatrix(const std::array<double, 7>& inputArray, Eigen::Matrix<double, 7, 1>& resultMatrix);
+    void calculate_tau_friction();
     Eigen::Matrix<double, 7, 1> saturateTorqueRate(const Eigen::Matrix<double, 7, 1>& tau_d_calculated, const Eigen::Matrix<double, 7, 1>& tau_J_d);  
     std::array<double, 6> convertToStdArray(const geometry_msgs::msg::WrenchStamped& wrench);
     //State vectors and matrices
@@ -105,12 +108,37 @@ public:
     Eigen::Matrix<double, 6, 1> O_F_ext_hat_K_M = Eigen::MatrixXd::Zero(6,1);
     Eigen::Matrix<double, 7, 1> q_;
     Eigen::Matrix<double, 7, 1> dq_;
-    Eigen::MatrixXd jacobian_transpose_pinv;  
+    Eigen::Matrix<double, 7, 1> dq_filtered = Eigen::MatrixXd::Zero(7,1); //rotational speed filtered for friction compensation
+    Eigen::Matrix<double, 7, 1> dq_imp = Eigen::MatrixXd::Zero(7,1); //"impedance dq", dq without the nullspace-part of it
+    Eigen::MatrixXd jacobian_transpose_pinv;
+    Eigen::MatrixXd jacobian_pinv;
+    Eigen::MatrixXd N;
+    Eigen::Matrix<double, 6, 7> jacobian;
 
+
+    //Friction variables
+    Eigen::Matrix<double, 7, 1> tau_impedance = Eigen::MatrixXd::Zero(7,1); //torque for every joint from Jacobi * F_cmd
+    Eigen::Matrix<double, 7, 1> tau_impedance_filtered = Eigen::MatrixXd::Zero(7,1); //filtered impedance torque for friction compensation
+    Eigen::Matrix<double, 7, 1> tau_friction = Eigen::MatrixXd::Zero(7,1); //torque compensating friction
+    Eigen::Matrix<double, 7, 1> tau_friction_impedance = Eigen::MatrixXd::Zero(7,1); //impedance torque needed for tau_friction
+    Eigen::Matrix<double, 7, 1> dq_s = (Eigen::VectorXd(7) << 0, 0, 0, 0.0001, 0, 0, 0.05).finished();
+    Eigen::Matrix<double, 7, 1> static_friction = (Eigen::VectorXd(7) << 1.025412896, 1.259913793, 0.8380147058, 1.005214968, 1.2928, 0.41525, 0.5341655).finished();
+    Eigen::Matrix<double, 7, 1> offset_friction = (Eigen::VectorXd(7) << -0.05, -0.70, -0.07, -0.13, -0.1025, 0.103, -0.02).finished();
+    Eigen::Matrix<double, 7, 1> coulomb_friction = (Eigen::VectorXd(7) << 1.025412896, 1.259913793, 0.8380147058, 0.96, 1.2928, 0.41525, 0.5341655).finished();
+    Eigen::Matrix<double, 7, 1> beta = (Eigen::VectorXd(7) << 1.18, 0, 0.55, 0.87, 0.935, 0.54, 0.45).finished();//component b of linear friction model (a + b*dq)  
+    Eigen::Matrix<double, 7, 1> dz = Eigen::MatrixXd::Zero(7,1);
+    Eigen::Matrix<double, 7, 1> z = Eigen::MatrixXd::Zero(7,1);
+    Eigen::Matrix<double, 7, 1> f = Eigen::MatrixXd::Zero(7,1);
+    Eigen::Matrix<double, 7, 1> g = Eigen::MatrixXd::Zero(7,1);
+    const Eigen::Matrix<double, 7, 1> sigma_0 = (Eigen::VectorXd(7) << 76.95, 37.94, 71.07, 44.02, 21.32, 21.83, 53).finished();
+    const Eigen::Matrix<double, 7, 1> sigma_1 = (Eigen::VectorXd(7) << 0.056, 0.06, 0.064, 0.073, 0.1, 0.0755, 0.000678).finished();
+    Eigen::Matrix<double, 6,6> K_friction = IDENTITY; //impedance stiffness term for friction compensation
+    Eigen::Matrix<double, 6,6> D_friction = IDENTITY; //impedance damping term for friction compensation
+    
     //Robot parameters
     const int num_joints = 7;
     const std::string state_interface_name_{"robot_state"};
-    const std::string robot_name_{"panda"};
+    const std::string robot_name_{"fr3"};
     const std::string k_robot_state_interface_name{"robot_state"};
     const std::string k_robot_model_interface_name{"robot_model"};
     franka_hardware::FrankaHardwareInterface interfaceClass;
@@ -129,9 +157,9 @@ public:
                                                                 0,   0,   0,   0, 130,   0,
                                                                 0,   0,   0,   0,   0,  10).finished();
 
-    Eigen::Matrix<double, 6, 6> D =  (Eigen::MatrixXd(6,6) <<  35,   0,   0,   0,   0,   0,
-                                                                0,  35,   0,   0,   0,   0,
-                                                                0,   0,  35,   0,   0,   0,  // impedance damping term
+    Eigen::Matrix<double, 6, 6> D =  (Eigen::MatrixXd(6,6) <<  30,   0,   0,   0,   0,   0,
+                                                                0,  30,   0,   0,   0,   0,
+                                                                0,   0,  30,   0,   0,   0,  // impedance damping term
                                                                 0,   0,   0,   25,   0,   0,
                                                                 0,   0,   0,   0,   25,   0,
                                                                 0,   0,   0,   0,   0,   6).finished();
@@ -197,6 +225,11 @@ public:
 
     //Filter-parameters
     double filter_params_{0.001};
-    int mode_ = 2;
+    int mode_ = 1;
+
+    //Friction_case
+    bool friction_ = false;
+
+    
 };
 }  // namespace cartesian_impedance_control

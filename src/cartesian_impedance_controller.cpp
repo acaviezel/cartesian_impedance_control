@@ -13,12 +13,10 @@
 // limitations under the License.
 
 #include <cartesian_impedance_control/cartesian_impedance_controller.hpp>
-
 #include <cassert>
 #include <cmath>
 #include <exception>
 #include <string>
-
 #include <Eigen/Eigen>
 
 namespace {
@@ -45,6 +43,7 @@ void CartesianImpedanceController::update_stiffness_and_references(){
   position_d_ = filter_params_ * position_d_target_ + (1.0 - filter_params_) * position_d_;
   orientation_d_ = orientation_d_.slerp(filter_params_, orientation_d_target_);
   F_contact_des = 0.05 * F_contact_target + 0.95 * F_contact_des;
+  
 }
 
 
@@ -158,6 +157,13 @@ CallbackReturn CartesianImpedanceController::on_activate(
   const rclcpp_lifecycle::State& /*previous_state*/) {
   franka_robot_model_->assign_loaned_state_interfaces(state_interfaces_);
 
+  // Create the subscriber in the on_activate method
+  desired_pose_sub = get_node()->create_subscription<geometry_msgs::msg::Pose>(
+        "cartesian_impedance_controller/reference_pose", 
+        10,  // Queue size
+        std::bind(&CartesianImpedanceController::reference_pose_callback, this, std::placeholders::_1)
+    );
+
   std::array<double, 16> initial_pose = franka_robot_model_->getPoseMatrix(franka::Frame::kEndEffector);
   Eigen::Affine3d initial_transform(Eigen::Matrix4d::Map(initial_pose.data()));
   position_d_ = initial_transform.translation();
@@ -189,6 +195,15 @@ void CartesianImpedanceController::topic_callback(const std::shared_ptr<franka_m
   arrayToMatrix(O_F_ext_hat_K, O_F_ext_hat_K_M);
 }
 
+void CartesianImpedanceController::reference_pose_callback(const geometry_msgs::msg::Pose::SharedPtr msg)
+{
+    // Handle the incoming pose message
+    std::cout << "received reference posistion as " <<  msg->position.x << ", " << msg->position.y << ", " << msg->position.z << std::endl;
+    position_d_target_ << msg->position.x, msg->position.y,msg->position.z;
+    orientation_d_target_.coeffs() << msg->orientation.x, msg->orientation.y, msg->orientation.z, msg->orientation.w;
+    // You can add more processing logic here
+}
+
 void CartesianImpedanceController::updateJointStates() {
   for (auto i = 0; i < num_joints; ++i) {
     const auto& position_interface = state_interfaces_.at(2 * i);
@@ -198,6 +213,39 @@ void CartesianImpedanceController::updateJointStates() {
     q_(i) = position_interface.get_value();
     dq_(i) = velocity_interface.get_value();
   }
+}
+
+//Calculate friciton forces and torques for joints
+void CartesianImpedanceController::calculate_tau_friction(){
+  double alpha = 0.01;
+  K_friction.topLeftCorner(3, 3) = 300 * Eigen::Matrix3d::Identity();
+  K_friction.bottomRightCorner(3, 3) << 50, 0, 0, 0, 50, 0, 0, 0, 10;
+  D_friction.topLeftCorner(3, 3) = 40 * Eigen::Matrix3d::Identity();
+  D_friction.bottomRightCorner(3, 3) << 18, 0, 0, 0, 18, 0, 0, 0, 7;
+  // Filtering dq of every joint
+  dq_filtered = alpha * dq_ + (1 - alpha) * dq_filtered;
+
+  // Filtering tau_impedance
+  tau_impedance_filtered = alpha * tau_impedance + (1 - alpha) * tau_impedance_filtered;
+
+  // Creating and filtering a "fake" tau_impedance with own weights, optimized for friction compensation
+  tau_friction_impedance = jacobian.transpose() * Sm * (-alpha * (D_friction * (jacobian * dq_) + K_friction * error)) + (1 - alpha) * tau_friction_impedance;
+
+  // Creating "fake" dq, that acts only in the impedance-space
+  dq_imp = dq_filtered - N * dq_filtered;
+  
+
+  Eigen::VectorXd f = beta.cwiseProduct(dq_imp) + offset_friction;
+  g(4) = (coulomb_friction(4) + (static_friction(4) - coulomb_friction(4)) * exp(-1 * std::abs(dq_imp(4) / dq_s(4))));
+  g(6) = (coulomb_friction(6) + (static_friction(6) - coulomb_friction(6)) * exp(-1 * std::abs(dq_imp(6) / dq_s(6))));
+  
+  dz = dq_imp.array() - dq_imp.array().abs() / g.array() * sigma_0.array() * z.array() + 0.025 * tau_friction_impedance.array();
+  dz(6) -= 0.02 * tau_friction_impedance(6);
+  
+  z = 0.001 * dz + z;
+  tau_friction = sigma_0.array() * z.array() + 100 * sigma_1.array() * dz.array() + f.array();
+  
+  //RCLCPP_INFO(this->get_logger(), "Friction forces and torques calculated.");
 }
 
 controller_interface::return_type CartesianImpedanceController::update(const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {  
@@ -264,6 +312,16 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
   I_F_error += dt * Sf* (F_contact_des - F_ext);
   F_cmd = Sf*(0.4 * (F_contact_des - F_ext) + 0.9 * I_F_error + 0.9 * F_contact_des);
 
+//Calculate friction forces
+  if(friction_){
+    calculate_tau_friction();
+  }
+  else{
+    tau_friction.setZero();
+  }
+
+
+
   Eigen::VectorXd tau_task(7), tau_nullspace(7), tau_d(7), tau_impedance(7);
   pseudoInverse(jacobian.transpose(), jacobian_transpose_pinv);
 
@@ -273,7 +331,7 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
                     (2.0 * sqrt(nullspace_stiffness_)) * dq_);  // if config control ) false we don't care about the joint position
 
   tau_impedance = jacobian.transpose() * Sm * (F_impedance /*+ F_repulsion + F_potential*/) + jacobian.transpose() * Sf * F_cmd;
-  auto tau_d_placeholder = tau_impedance + tau_nullspace + coriolis; //add nullspace and coriolis components to desired torque
+  auto tau_d_placeholder = tau_impedance + tau_nullspace +tau_friction +coriolis; //add nullspace and coriolis components to desired torque
   tau_d << tau_d_placeholder;
   tau_d << saturateTorqueRate(tau_d, tau_J_d_M);  // Saturate torque rate to avoid discontinuities
   tau_J_d_M = tau_d;
