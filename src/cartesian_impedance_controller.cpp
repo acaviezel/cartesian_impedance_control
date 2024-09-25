@@ -215,38 +215,6 @@ void CartesianImpedanceController::updateJointStates() {
   }
 }
 
-//Calculate friciton forces and torques for joints
-void CartesianImpedanceController::calculate_tau_friction(){
-  double alpha = 0.01;
-  K_friction.topLeftCorner(3, 3) = 300 * Eigen::Matrix3d::Identity();
-  K_friction.bottomRightCorner(3, 3) << 50, 0, 0, 0, 50, 0, 0, 0, 10;
-  D_friction.topLeftCorner(3, 3) = 40 * Eigen::Matrix3d::Identity();
-  D_friction.bottomRightCorner(3, 3) << 18, 0, 0, 0, 18, 0, 0, 0, 7;
-  // Filtering dq of every joint
-  dq_filtered = alpha * dq_ + (1 - alpha) * dq_filtered;
-
-  // Filtering tau_impedance
-  tau_impedance_filtered = alpha * tau_impedance + (1 - alpha) * tau_impedance_filtered;
-
-  // Creating and filtering a "fake" tau_impedance with own weights, optimized for friction compensation
-  tau_friction_impedance = jacobian.transpose() * Sm * (-alpha * (D_friction * (jacobian * dq_) + K_friction * error)) + (1 - alpha) * tau_friction_impedance;
-
-  // Creating "fake" dq, that acts only in the impedance-space
-  dq_imp = dq_filtered - N * dq_filtered;
-  
-
-  Eigen::VectorXd f = beta.cwiseProduct(dq_imp) + offset_friction;
-  g(4) = (coulomb_friction(4) + (static_friction(4) - coulomb_friction(4)) * exp(-1 * std::abs(dq_imp(4) / dq_s(4))));
-  g(6) = (coulomb_friction(6) + (static_friction(6) - coulomb_friction(6)) * exp(-1 * std::abs(dq_imp(6) / dq_s(6))));
-  
-  dz = dq_imp.array() - dq_imp.array().abs() / g.array() * sigma_0.array() * z.array() + 0.025 * tau_friction_impedance.array();
-  dz(6) -= 0.02 * tau_friction_impedance(6);
-  
-  z = 0.001 * dz + z;
-  tau_friction = sigma_0.array() * z.array() + 100 * sigma_1.array() * dz.array() + f.array();
-  
-  //RCLCPP_INFO(this->get_logger(), "Friction forces and torques calculated.");
-}
 
 controller_interface::return_type CartesianImpedanceController::update(const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {  
   // if (outcounter == 0){
@@ -264,7 +232,9 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
   std::array<double, 42> jacobian_array =  franka_robot_model_->getZeroJacobian(franka::Frame::kEndEffector);
   std::array<double, 16> pose = franka_robot_model_->getPoseMatrix(franka::Frame::kEndEffector);
   Eigen::Map<Eigen::Matrix<double, 7, 1>> coriolis(coriolis_array.data());
-  Eigen::Map<Eigen::Matrix<double, 6, 7>> jacobian(jacobian_array.data());
+  jacobian = Eigen::Map<Eigen::Matrix<double, 6, 7>> (jacobian_array.data());
+  pseudoInverse(jacobian.transpose(), jacobian_transpose_pinv);
+  pseudoInverse(jacobian, jacobian_pinv);
   Eigen::Map<Eigen::Matrix<double, 7, 7>> M(mass.data());
   Eigen::Affine3d transform(Eigen::Matrix4d::Map(pose.data()));
   Eigen::Vector3d position(transform.translation());
@@ -292,46 +262,37 @@ controller_interface::return_type CartesianImpedanceController::update(const rcl
   // Theta = T*Lambda;
   // F_impedance = -1*(Lambda * Theta.inverse() - IDENTITY) * F_ext;
   //Inertia of the robot
-  switch (mode_)
+/*   switch (mode_)
   {
-  case 1:
+  case 1: */
     Theta = Lambda;
     F_impedance = -1 * (D * (jacobian * dq_) + K * error /*+ I_error*/);
-    break;
+/*     break; */
 
-  case 2:
+  /*case 2:
     Theta = T*Lambda;
     F_impedance = -1*(Lambda * Theta.inverse() - IDENTITY) * F_ext;
     break;
   
   default:
-    break;
-  }
+    break;*/
+  //}
 
   F_ext = 0.9 * F_ext + 0.1 * O_F_ext_hat_K_M; //Filtering 
   I_F_error += dt * Sf* (F_contact_des - F_ext);
   F_cmd = Sf*(0.4 * (F_contact_des - F_ext) + 0.9 * I_F_error + 0.9 * F_contact_des);
 
 //Calculate friction forces
-  if(friction_){
-    calculate_tau_friction();
-  }
-  else{
-    tau_friction.setZero();
-  }
-
-
-
+  N = (Eigen::MatrixXd::Identity(7, 7) - jacobian_pinv * jacobian);
   Eigen::VectorXd tau_task(7), tau_nullspace(7), tau_d(7), tau_impedance(7);
   pseudoInverse(jacobian.transpose(), jacobian_transpose_pinv);
 
-  tau_nullspace << (Eigen::MatrixXd::Identity(7, 7) -
-                    jacobian.transpose() * jacobian_transpose_pinv) *
-                    (nullspace_stiffness_ * config_control * (q_d_nullspace_ - q_) - //if config_control = true we control the whole robot configuration
+  tau_nullspace <<  N * (nullspace_stiffness_ * config_control * (q_d_nullspace_ - q_) - //if config_control = true we control the whole robot configuration
                     (2.0 * sqrt(nullspace_stiffness_)) * dq_);  // if config control ) false we don't care about the joint position
 
+  calculate_tau_friction();
   tau_impedance = jacobian.transpose() * Sm * (F_impedance /*+ F_repulsion + F_potential*/) + jacobian.transpose() * Sf * F_cmd;
-  auto tau_d_placeholder = tau_impedance + tau_nullspace +tau_friction +coriolis; //add nullspace and coriolis components to desired torque
+  auto tau_d_placeholder = tau_impedance + tau_nullspace + tau_friction +coriolis; //add nullspace and coriolis components to desired torque
   tau_d << tau_d_placeholder;
   tau_d << saturateTorqueRate(tau_d, tau_J_d_M);  // Saturate torque rate to avoid discontinuities
   tau_J_d_M = tau_d;

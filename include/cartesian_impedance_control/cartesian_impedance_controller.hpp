@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
+
+
+
 #pragma once
 
 #include <array>
@@ -78,7 +82,7 @@ public:
   controller_interface::CallbackReturn on_deactivate(
       const rclcpp_lifecycle::State& previous_state) override;
 
-    void setPose(const std::shared_ptr<messages_fr3::srv::SetPose::Request> request, 
+  void setPose(const std::shared_ptr<messages_fr3::srv::SetPose::Request> request, 
     std::shared_ptr<messages_fr3::srv::SetPose::Response> response);
       
 
@@ -100,41 +104,54 @@ public:
     Eigen::Matrix<double, 7, 1> saturateTorqueRate(const Eigen::Matrix<double, 7, 1>& tau_d_calculated, const Eigen::Matrix<double, 7, 1>& tau_J_d);  
     std::array<double, 6> convertToStdArray(const geometry_msgs::msg::WrenchStamped& wrench);
     //State vectors and matrices
+    Eigen::Matrix<double, 7, 7> M;
     std::array<double, 7> q_subscribed;
     std::array<double, 7> tau_J_d = {0,0,0,0,0,0,0};
     std::array<double, 6> O_F_ext_hat_K = {0,0,0,0,0,0};
     Eigen::Matrix<double, 7, 1> q_subscribed_M;
+    Eigen::Matrix<double, 6, 7> jacobian;
     Eigen::Matrix<double, 7, 1> tau_J_d_M = Eigen::MatrixXd::Zero(7, 1);
     Eigen::Matrix<double, 6, 1> O_F_ext_hat_K_M = Eigen::MatrixXd::Zero(6,1);
     Eigen::Matrix<double, 7, 1> q_;
     Eigen::Matrix<double, 7, 1> dq_;
-    Eigen::Matrix<double, 7, 1> dq_filtered = Eigen::MatrixXd::Zero(7,1); //rotational speed filtered for friction compensation
-    Eigen::Matrix<double, 7, 1> dq_imp = Eigen::MatrixXd::Zero(7,1); //"impedance dq", dq without the nullspace-part of it
-    Eigen::MatrixXd jacobian_transpose_pinv;
+    Eigen::Matrix<double, 7, 1> dq_filtered;
+    Eigen::MatrixXd jacobian_transpose_pinv;  
     Eigen::MatrixXd jacobian_pinv;
-    Eigen::MatrixXd N;
-    Eigen::Matrix<double, 6, 7> jacobian;
-
-
-    //Friction variables
-    Eigen::Matrix<double, 7, 1> tau_impedance = Eigen::MatrixXd::Zero(7,1); //torque for every joint from Jacobi * F_cmd
-    Eigen::Matrix<double, 7, 1> tau_impedance_filtered = Eigen::MatrixXd::Zero(7,1); //filtered impedance torque for friction compensation
-    Eigen::Matrix<double, 7, 1> tau_friction = Eigen::MatrixXd::Zero(7,1); //torque compensating friction
-    Eigen::Matrix<double, 7, 1> tau_friction_impedance = Eigen::MatrixXd::Zero(7,1); //impedance torque needed for tau_friction
-    Eigen::Matrix<double, 7, 1> dq_s = (Eigen::VectorXd(7) << 0, 0, 0, 0.0001, 0, 0, 0.05).finished();
-    Eigen::Matrix<double, 7, 1> static_friction = (Eigen::VectorXd(7) << 1.025412896, 1.259913793, 0.8380147058, 1.005214968, 1.2928, 0.41525, 0.5341655).finished();
-    Eigen::Matrix<double, 7, 1> offset_friction = (Eigen::VectorXd(7) << -0.05, -0.70, -0.07, -0.13, -0.1025, 0.103, -0.02).finished();
-    Eigen::Matrix<double, 7, 1> coulomb_friction = (Eigen::VectorXd(7) << 1.025412896, 1.259913793, 0.8380147058, 0.96, 1.2928, 0.41525, 0.5341655).finished();
-    Eigen::Matrix<double, 7, 1> beta = (Eigen::VectorXd(7) << 1.18, 0, 0.55, 0.87, 0.935, 0.54, 0.45).finished();//component b of linear friction model (a + b*dq)  
+    // control input
+    int control_mode; // either position control or velocity control
+    Eigen::Matrix<double, 7, 1> tau_impedance; // admittance torque
+    Eigen::Matrix<double, 7, 1> tau_impedance_filtered = Eigen::MatrixXd::Zero(7,1); // admittance torque filtered
+    Eigen::Matrix<double, 7, 1> tau_friction;
+    Eigen::Matrix<double, 7, 1> tau_threshold;  //Creating and filtering a "fake" tau_impedance with own weights, optimized for friction compensation
+    bool friction_ = true; // set if friciton compensation should be turned on
+    Eigen::MatrixXd N; // nullspace projection matrix
+    // friction compensation observer
     Eigen::Matrix<double, 7, 1> dz = Eigen::MatrixXd::Zero(7,1);
     Eigen::Matrix<double, 7, 1> z = Eigen::MatrixXd::Zero(7,1);
     Eigen::Matrix<double, 7, 1> f = Eigen::MatrixXd::Zero(7,1);
     Eigen::Matrix<double, 7, 1> g = Eigen::MatrixXd::Zero(7,1);
-    const Eigen::Matrix<double, 7, 1> sigma_0 = (Eigen::VectorXd(7) << 76.95, 37.94, 71.07, 44.02, 21.32, 21.83, 53).finished();
-    const Eigen::Matrix<double, 7, 1> sigma_1 = (Eigen::VectorXd(7) << 0.056, 0.06, 0.064, 0.073, 0.1, 0.0755, 0.000678).finished();
     Eigen::Matrix<double, 6,6> K_friction = IDENTITY; //impedance stiffness term for friction compensation
     Eigen::Matrix<double, 6,6> D_friction = IDENTITY; //impedance damping term for friction compensation
+    const Eigen::Matrix<double, 7, 1> sigma_0 = (Eigen::VectorXd(7) << 76.95, 37.94, 71.07, 44.02, 21.32, 21.83, 53).finished();
+    const Eigen::Matrix<double, 7, 1> sigma_1 = (Eigen::VectorXd(7) << 0.056, 0.06, 0.064, 0.073, 0.1, 0.0755, 0.000678).finished();
+    //friction compensation model paramers (coulomb, viscous, stribeck)
+    Eigen::Matrix<double, 7, 1> dq_s = (Eigen::VectorXd(7) << 0, 0, 0, 0.0001, 0, 0, 0.05).finished();
+    Eigen::Matrix<double, 7, 1> static_friction = (Eigen::VectorXd(7) << 1.025412896, 1.259913793, 0.8380147058, 1.005214968, 1.2928, 0.41525, 0.5341655).finished();
+    Eigen::Matrix<double, 7, 1> offset_friction = (Eigen::VectorXd(7) << -0.05, -0.70, -0.07, -0.13, -0.1025, 0.103, -0.02).finished();
+    Eigen::Matrix<double, 7, 1> coulomb_friction = (Eigen::VectorXd(7) << 1.025412896, 1.259913793, 0.8380147058, 0.96, 1.2928, 0.41525, 0.5341655).finished();
+    Eigen::Matrix<double, 7, 1> beta = (Eigen::VectorXd(7) << 1.18, 0, 0.55, 0.87, 0.935, 0.54, 0.45).finished();//component b of linear friction model (a + b*dq)
     
+    /*const Eigen::Matrix<double, 7, 1> sigma_0 = (Eigen::VectorXd(7) << 76.95, 37.94, 71.07, 44.02, 21.32, 21.83, 53).finished();
+    const Eigen::Matrix<double, 7, 1> sigma_1 = (Eigen::VectorXd(7) << 0.056, 0.06, 0.064, 0.073, 0.1, 0.0755, 0.000678).finished();
+    //friction compensation model paramers (coulomb, viscous, stribeck)
+    Eigen::Matrix<double, 7, 1> dq_s = (Eigen::VectorXd(7) << 0, 0, 0, 0.001, 0, 0, 0.05).finished();
+    Eigen::Matrix<double, 7, 1> static_friction = (Eigen::VectorXd(7) << 1.24, 1.49, 1.22, 1.22, 1.6, 0.76, 0.68).finished();
+    Eigen::Matrix<double, 7, 1> offset_friction = (Eigen::VectorXd(7) << -0.05, -0.70, -0.07, -0.19, -0.1025, 0.103, -0.02).finished();
+    Eigen::Matrix<double, 7, 1> coulomb_friction = (Eigen::VectorXd(7) << 1.27, 1.48, 1.25, 0.96, 1.6, 0.76, 0.68).finished();
+    Eigen::Matrix<double, 7, 1> beta = (Eigen::VectorXd(7) << 1.18, 0, 0.55, 1.09, 0.935, 0.54, 0.43).finished();//component b of linear friction model (a + b*dq)*/
+    
+
+
     //Robot parameters
     const int num_joints = 7;
     const std::string state_interface_name_{"robot_state"};
@@ -157,9 +174,9 @@ public:
                                                                 0,   0,   0,   0, 130,   0,
                                                                 0,   0,   0,   0,   0,  10).finished();
 
-    Eigen::Matrix<double, 6, 6> D =  (Eigen::MatrixXd(6,6) <<  30,   0,   0,   0,   0,   0,
-                                                                0,  30,   0,   0,   0,   0,
-                                                                0,   0,  30,   0,   0,   0,  // impedance damping term
+    Eigen::Matrix<double, 6, 6> D =  (Eigen::MatrixXd(6,6) <<  35,   0,   0,   0,   0,   0,
+                                                                0,  35,   0,   0,   0,   0,
+                                                                0,   0,  35,   0,   0,   0,  // impedance damping term
                                                                 0,   0,   0,   25,   0,   0,
                                                                 0,   0,   0,   0,   25,   0,
                                                                 0,   0,   0,   0,   0,   6).finished();
@@ -225,11 +242,6 @@ public:
 
     //Filter-parameters
     double filter_params_{0.001};
-    int mode_ = 1;
-
-    //Friction_case
-    bool friction_ = false;
-
-    
+    //int mode_ = 1;                      // impedance control mode (deactivated because of Simon)    
 };
 }  // namespace cartesian_impedance_control
