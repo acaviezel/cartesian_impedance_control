@@ -23,7 +23,7 @@ cartesian_impedance_controller:
 
 Clone the messages package in the src directory: <br />
 ```bash
-git clone https://github.com/CurdinDeplazes/messages_fr3.git
+https://github.com/acaviezel/cartesian_impedance_control.git
 ```
 
 Build the package or whole workspace: <br />
