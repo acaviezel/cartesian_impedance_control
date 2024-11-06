@@ -49,11 +49,15 @@
 
 #include "franka_msgs/msg/franka_robot_state.hpp"
 #include "franka_msgs/msg/errors.hpp"
+#include "franka_msgs/srv/set_load.hpp"
 #include "messages_fr3/srv/set_pose.hpp"
-
+#include "messages_fr3/msg/tau_gravity.hpp"
+#include "messages_fr3/msg/jacobian.hpp"
+#include "messages_fr3/msg/transformation_matrix.hpp"
+#include "messages_fr3/msg/gravity_force_vector.hpp"
 #include "franka_semantic_components/franka_robot_model.hpp"
 #include "franka_semantic_components/franka_robot_state.hpp"
-
+#include "messages_fr3/msg/acceleration.hpp"
 #define IDENTITY Eigen::MatrixXd::Identity(6, 6)
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
@@ -89,18 +93,31 @@ public:
  private:
     //Nodes
     rclcpp::Subscription<franka_msgs::msg::FrankaRobotState>::SharedPtr franka_state_subscriber = nullptr;
+    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr desired_joint_state_subscriber_ = nullptr;
     rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr desired_pose_sub;
+    rclcpp::Publisher<messages_fr3::msg::TauGravity>::SharedPtr tau_gravity_publisher_;
+    rclcpp::Publisher<messages_fr3::msg::Jacobian>::SharedPtr jacobian_publisher_;
+    rclcpp::Publisher<messages_fr3::msg::TransformationMatrix>::SharedPtr transformation_publisher_;
+    rclcpp::Publisher<messages_fr3::msg::Acceleration>::SharedPtr acceleration_publisher_;
+    rclcpp::Publisher<messages_fr3::msg::GravityForceVector>::SharedPtr gravity_force_vector_publisher_;
     rclcpp::Service<messages_fr3::srv::SetPose>::SharedPtr pose_srv_;
 
 
     //Functions
     void topic_callback(const std::shared_ptr<franka_msgs::msg::FrankaRobotState> msg);
+    void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg);
+    void desiredJointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg);
     void reference_pose_callback(const geometry_msgs::msg::Pose::SharedPtr msg);
     void updateJointStates();
     void update_stiffness_and_references();
     void arrayToMatrix(const std::array<double, 6>& inputArray, Eigen::Matrix<double, 6, 1>& resultMatrix);
     void arrayToMatrix(const std::array<double, 7>& inputArray, Eigen::Matrix<double, 7, 1>& resultMatrix);
     void calculate_tau_friction();
+    void calculate_residual_torque(const Eigen::Map<Eigen::Matrix<double, 7, 1>>& coriolis, const Eigen::Map<Eigen::Matrix<double, 7, 1>>& gravity_force_vector);
+    void calculateRTOB();
+    void calculate_tau_gravity(const Eigen::Map<Eigen::Matrix<double, 7, 1>>& coriolis, const Eigen::Map<Eigen::Matrix<double, 7, 1>>& gravity_force_vector, const Eigen::Matrix<double, 6, 7>& jacobian);
+    void calculate_gravity_torques();
+    void calculate_gravity_torques_ana(const Eigen::Matrix<double, 6, 7>& jacobian);
     Eigen::Matrix<double, 7, 1> saturateTorqueRate(const Eigen::Matrix<double, 7, 1>& tau_d_calculated, const Eigen::Matrix<double, 7, 1>& tau_J_d);  
     std::array<double, 6> convertToStdArray(const geometry_msgs::msg::WrenchStamped& wrench);
     //State vectors and matrices
@@ -113,14 +130,41 @@ public:
     Eigen::Matrix<double, 7, 1> tau_J_d_M = Eigen::MatrixXd::Zero(7, 1);
     Eigen::Matrix<double, 6, 1> O_F_ext_hat_K_M = Eigen::MatrixXd::Zero(6,1);
     Eigen::Matrix<double, 7, 1> q_;
+    Eigen::Matrix<double, 7, 1> q_desired_ = (Eigen::Matrix<double, 7, 1>() <<
+        0.0,         // A1: (-166 + 166) / 2 in radians
+        -0.7854,         // A2: (-105 + 105) / 2 in radians
+        0.0,         // A3: (-166 + 166) / 2 in radians
+        -2.356,   // A4: (-176 + -7) / 2 in radians
+        0.0,         // A5: (-165 + 165) / 2 in radians
+        1.57,    // A6: (25 + 265) / 2 in radians
+        0.87          // A7: (-175 + 175) / 2 in radians
+    ).finished();
+    Eigen::Matrix<double, 7, 1> q_d_ = (Eigen::Matrix<double, 7, 1>() <<
+        0.0,         // A1: (-166 + 166) / 2 in radians
+        -0.7854,         // A2: (-105 + 105) / 2 in radians
+        0.0,         // A3: (-166 + 166) / 2 in radians
+        -2.356,   // A4: (-176 + -7) / 2 in radians
+        0.0,         // A5: (-165 + 165) / 2 in radians
+        1.57,    // A6: (25 + 265) / 2 in radians
+        0.87          // A7: (-175 + 175) / 2 in radians
+    ).finished();
     Eigen::Matrix<double, 7, 1> dq_;
+    Eigen::Matrix<double, 7, 1> dq_prev_;
+    Eigen::Matrix<double, 7, 1> ddq_;
+    Eigen::Matrix<double, 7, 1> q_prev;
     Eigen::Matrix<double, 7, 1> dq_filtered;
+    Eigen::Matrix<double, 7, 1> dq_filtered_gravity;
     Eigen::MatrixXd jacobian_transpose_pinv;  
     Eigen::MatrixXd jacobian_pinv;
+    //initialize jacobian array wiht all zeros 42x1
+    std::array<double, 42> jacobian_array;
+    std::array<double,42> jacobian_prev_;
+    std::array<double,42> jacobian_endeffector;
+    std::array<double,42> dJ;
     // control input
     int control_mode; // either position control or velocity control
-    Eigen::Matrix<double, 7, 1> tau_impedance; // admittance torque
-    Eigen::Matrix<double, 7, 1> tau_impedance_filtered = Eigen::MatrixXd::Zero(7,1); // admittance torque filtered
+    Eigen::Matrix<double, 7, 1> tau_impedance; // impedance torque
+    Eigen::Matrix<double, 7, 1> tau_impedance_filtered = Eigen::MatrixXd::Zero(7,1); // impedance torque filtered
     Eigen::Matrix<double, 7, 1> tau_friction;
     Eigen::Matrix<double, 7, 1> tau_threshold;  //Creating and filtering a "fake" tau_impedance with own weights, optimized for friction compensation
     bool friction_ = true; // set if friciton compensation should be turned on
@@ -136,22 +180,38 @@ public:
     const Eigen::Matrix<double, 7, 1> sigma_1 = (Eigen::VectorXd(7) << 0.056, 0.06, 0.064, 0.073, 0.1, 0.0755, 0.000678).finished();
     //friction compensation model paramers (coulomb, viscous, stribeck)
     Eigen::Matrix<double, 7, 1> dq_s = (Eigen::VectorXd(7) << 0, 0, 0, 0.0001, 0, 0, 0.05).finished();
-    Eigen::Matrix<double, 7, 1> static_friction = (Eigen::VectorXd(7) << 1.025412896, 1.259913793, 0.8380147058, 1.005214968, 1.2928, 0.41525, 0.5341655).finished();
+    Eigen::Matrix<double, 7, 1> static_friction = (Eigen::VectorXd(7) << 1.025412896, 1.259913793, 0.8380147058, 1.005214968, 1.2928, 0.41525, 0.5341655).finished(); 
     Eigen::Matrix<double, 7, 1> offset_friction = (Eigen::VectorXd(7) << -0.05, -0.70, -0.07, -0.13, -0.1025, 0.103, -0.02).finished();
     Eigen::Matrix<double, 7, 1> coulomb_friction = (Eigen::VectorXd(7) << 1.025412896, 1.259913793, 0.8380147058, 0.96, 1.2928, 0.41525, 0.5341655).finished();
     Eigen::Matrix<double, 7, 1> beta = (Eigen::VectorXd(7) << 1.18, 0, 0.55, 0.87, 0.935, 0.54, 0.45).finished();//component b of linear friction model (a + b*dq)
     
-    /*const Eigen::Matrix<double, 7, 1> sigma_0 = (Eigen::VectorXd(7) << 76.95, 37.94, 71.07, 44.02, 21.32, 21.83, 53).finished();
-    const Eigen::Matrix<double, 7, 1> sigma_1 = (Eigen::VectorXd(7) << 0.056, 0.06, 0.064, 0.073, 0.1, 0.0755, 0.000678).finished();
-    //friction compensation model paramers (coulomb, viscous, stribeck)
-    Eigen::Matrix<double, 7, 1> dq_s = (Eigen::VectorXd(7) << 0, 0, 0, 0.001, 0, 0, 0.05).finished();
-    Eigen::Matrix<double, 7, 1> static_friction = (Eigen::VectorXd(7) << 1.24, 1.49, 1.22, 1.22, 1.6, 0.76, 0.68).finished();
-    Eigen::Matrix<double, 7, 1> offset_friction = (Eigen::VectorXd(7) << -0.05, -0.70, -0.07, -0.19, -0.1025, 0.103, -0.02).finished();
-    Eigen::Matrix<double, 7, 1> coulomb_friction = (Eigen::VectorXd(7) << 1.27, 1.48, 1.25, 0.96, 1.6, 0.76, 0.68).finished();
-    Eigen::Matrix<double, 7, 1> beta = (Eigen::VectorXd(7) << 1.18, 0, 0.55, 1.09, 0.935, 0.54, 0.43).finished();//component b of linear friction model (a + b*dq)*/
+    //gravity compensation
+    Eigen::Matrix<double, 7, 1> tau_gravity_filtered = Eigen::MatrixXd::Zero(7,1);
+    Eigen::Matrix<double, 7, 1> tau_gravity_filtered_prev = Eigen::MatrixXd::Zero(7,1);
+    Eigen::Matrix<double, 7, 1> tau_gravity = Eigen::MatrixXd::Zero(7,1);
+    Eigen::Matrix<double, 7, 1> gravity_force = Eigen::MatrixXd::Zero(7,1);
+    Eigen::Matrix<double, 7, 1> tau_gravity_ana = Eigen::MatrixXd::Zero(7,1);
+    Eigen::Matrix<double, 7, 1> tau_gravity_error = Eigen::MatrixXd::Zero(7,1);
+    Eigen::Matrix<double, 7, 1> residual = Eigen::MatrixXd::Zero(7,1);
+    Eigen::Matrix<double, 7, 1> residual_prev = Eigen::MatrixXd::Zero(7,1);
+    Eigen::Matrix<double, 7, 1> tau_J;
+    Eigen::Matrix<double, 7, 7> M_prev= Eigen::MatrixXd::Zero(7,7); // Previous mass matrix for numerical differentiation
+    Eigen::Matrix<double, 7, 1> I_tau= Eigen::MatrixXd::Zero(7,1); // Integral of torque over time
+    Eigen::Matrix<double, 7, 1> I_tau_prev= Eigen::MatrixXd::Zero(7,1);
+    Eigen::Matrix<double, 7, 1> tau_commanded;  // To store commanded torques
+    Eigen::Matrix<double, 7, 7> kp;  // Diagonal matrix for kp
+    Eigen::Matrix<double, 7, 7> kd;  // Diagonal matrix for kd
     
 
 
+    Eigen::Matrix<double, 7, 7> K_0; //gain for residual torque observer
+    double filter_gain = 0.1; //filter gain for residual torque observer
+    bool gravity_ = true; // set if gravity compensation should be turned on
+    double m_estimated = 0.0; // estimated mass of the load
+    Eigen::Matrix<double, 3, 1> r_CoM_estimated = Eigen::MatrixXd::Zero(3,1); // estimated center of mass of the load
+    Eigen::Matrix<double, 7, 1> tau_load = Eigen::MatrixXd::Zero(7,1); // load torque
+    Eigen::Matrix<double, 6, 1> wrench_load; // load wrench
+    
     //Robot parameters
     const int num_joints = 7;
     const std::string state_interface_name_{"robot_state"};
@@ -167,12 +227,12 @@ public:
     Eigen::Matrix<double, 6, 6> Lambda = IDENTITY;                                           // operational space mass matrix
     Eigen::Matrix<double, 6, 6> Sm = IDENTITY;                                               // task space selection matrix for positions and rotation
     Eigen::Matrix<double, 6, 6> Sf = Eigen::MatrixXd::Zero(6, 6);                            // task space selection matrix for forces
-    Eigen::Matrix<double, 6, 6> K =  (Eigen::MatrixXd(6,6) << 250,   0,   0,   0,   0,   0,
+    Eigen::Matrix<double, 6, 6> K =  Eigen::MatrixXd::Zero(6, 6);/*(Eigen::MatrixXd(6,6) << 250,   0,   0,   0,   0,   0,
                                                                 0, 250,   0,   0,   0,   0,
                                                                 0,   0, 250,   0,   0,   0,  // impedance stiffness term
                                                                 0,   0,   0, 130,   0,   0,
                                                                 0,   0,   0,   0, 130,   0,
-                                                                0,   0,   0,   0,   0,  10).finished();
+                                                                0,   0,   0,   0,   0,  10).finished();*/
 
     Eigen::Matrix<double, 6, 6> D =  (Eigen::MatrixXd(6,6) <<  35,   0,   0,   0,   0,   0,
                                                                 0,  35,   0,   0,   0,   0,
@@ -242,6 +302,6 @@ public:
 
     //Filter-parameters
     double filter_params_{0.001};
-    //int mode_ = 1;                      // impedance control mode (deactivated because of Simon)    
+    int mode_ = 2;                      // impedance control mode (deactivated because of Simon)    
 };
 }  // namespace cartesian_impedance_control

@@ -35,6 +35,7 @@ add_library(
         src/cartesian_impedance_controller.cpp
         src/user_input_server.cpp
         src/friction_compensation.cpp
+        src/gravity_compensation.cpp
         )
 target_include_directories(
         ${PROJECT_NAME}
@@ -53,6 +54,7 @@ ament_target_dependencies(
         franka_semantic_components
         std_msgs
         messages_fr3
+        franka_msgs
 )
 
 
@@ -128,5 +130,6 @@ ament_export_dependencies(
         rclcpp_lifecycle
         hardware_interface
         messages_fr3
+        franka_msgs
 )
 ament_package()
