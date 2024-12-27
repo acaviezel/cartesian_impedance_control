@@ -13,7 +13,7 @@ Once you have everything set up, follow the steps below to get the controller ru
 Clone this repository in the src directory of your franka_ros2_ws: <br />
 ```bash
 cd franka_ros2_ws/src 
-git clone https://github.com/CurdinDeplazes/cartesian_impedance_control.git
+git clone https://github.com/acaviezel/cartesian_impedance_control.git
 ```
 For the moment, you need to add the following lines of code, to your controllers.yaml file inside franka_ros2/franka_bringup/config/:
 ```bash
@@ -23,7 +23,7 @@ cartesian_impedance_controller:
 
 Clone the messages package in the src directory: <br />
 ```bash
-https://github.com/acaviezel/cartesian_impedance_control.git
+ git clone https://github.com/acaviezel/messages_fr3.git
 ```
 
 Build the package or whole workspace: <br />
